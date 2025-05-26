@@ -5,7 +5,7 @@
 // distributed with this file, You can obtain one at
 // http://mozilla.org/MPL/2.0/.
 
-use std::{ffi::CString, io, mem, num::NonZeroUsize, os::fd::RawFd};
+use std::{ffi::CString, io, mem, os::fd::RawFd};
 
 use bitflags::bitflags;
 use memmap2::{MmapMut, MmapOptions};
@@ -120,13 +120,26 @@ impl Shm {
     }
 
     /// Try to create a [`memmap2::MmapMut`] by which we can read and write to this shared memory
-    /// object.
-    pub fn map(&self, offset: u64, len: Option<NonZeroUsize>) -> io::Result<MmapMut> {
-        let mut opts = MmapOptions::new();
-        opts.offset(offset);
-        if let Some(len) = len {
-            opts.len(len.get());
+    /// object. The provided `offset` may not be greater than or equal to the value returned by
+    /// [`Self::size`] (if it is, this function will return an error).
+    ///
+    /// This function is generally only useful if one has already called [`Self::set_size`]. If one
+    /// hasn't, this function will return a mapped area with a length of 0, so writing to and
+    /// reading from it will either fail or do nothing.
+    pub fn map(&self, offset: usize) -> io::Result<MmapMut> {
+        let size = self.size()?;
+
+        if offset >= size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "The provided offset must not be greater than self.size()"
+            ))
         }
+
+        let mut opts = MmapOptions::new();
+        // 128-bit computers don't exist so this conversion won't lose any precision
+        opts.offset(offset as u64);
+        opts.len(size - offset);
 
         // SAFETY: This is sound because the potential unsoundness comes from having a file open
         // that is written to/read from at the same time as another process. Since we're using a
@@ -145,5 +158,23 @@ impl Shm {
 impl Drop for Shm {
     fn drop(&mut self) {
         unsafe { libc::close(self.fd) };
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn offset_larger_than_map_fails() {
+        let shm = Shm::open(
+            "__psx_shm_oltmp_ahafeufhdmdhkeysmash",
+            OpenOptions::READWRITE | OpenOptions::CREATE,
+            OpenMode::R_USR | OpenMode::W_USR
+        ).unwrap();
+        shm.set_size(20).unwrap();
+        let err = shm.map(21).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }
