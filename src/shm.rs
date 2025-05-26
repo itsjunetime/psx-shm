@@ -132,8 +132,8 @@ impl Shm {
         if offset >= size {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "The provided offset must not be greater than self.size()"
-            ))
+                "The provided offset must not be greater than self.size()",
+            ));
         }
 
         let mut opts = MmapOptions::new();
@@ -170,8 +170,9 @@ mod test {
         let shm = Shm::open(
             "__psx_shm_oltmp_ahafeufhdmdhkeysmash",
             OpenOptions::READWRITE | OpenOptions::CREATE,
-            OpenMode::R_USR | OpenMode::W_USR
-        ).unwrap();
+            OpenMode::R_USR | OpenMode::W_USR,
+        )
+        .unwrap();
         shm.set_size(20).unwrap();
         let err = shm.map(21).unwrap_err();
 
