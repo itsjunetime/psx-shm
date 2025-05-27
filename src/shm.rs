@@ -5,7 +5,7 @@
 // distributed with this file, You can obtain one at
 // http://mozilla.org/MPL/2.0/.
 
-use std::{ffi::CString, io, mem, os::fd::RawFd};
+use std::{ffi::CString, io, marker::PhantomData, mem, os::fd::RawFd};
 
 use bitflags::bitflags;
 use memmap2::{MmapMut, MmapOptions};
@@ -103,7 +103,7 @@ impl Shm {
     }
 
     /// Sets the size of the shared memory with `ftruncate`.
-    pub fn set_size(&self, size: usize) -> io::Result<()> {
+    pub fn set_size(&mut self, size: usize) -> io::Result<()> {
         let r = unsafe { libc::ftruncate(self.fd, size as libc::off_t) };
         if r == 0 {
             return Ok(());
@@ -126,7 +126,21 @@ impl Shm {
     /// This function is generally only useful if one has already called [`Self::set_size`]. If one
     /// hasn't, this function will return a mapped area with a length of 0, so writing to and
     /// reading from it will either fail or do nothing.
-    pub fn map(&self, offset: usize) -> io::Result<MmapMut> {
+    ///
+    /// # Safety
+    ///
+    /// This is unsafe due to the fundamental nature of memory shared between processes. The
+    /// documentation for [`memmap2::MmapOptions::map_mut`] can share more details, but doesn't
+    /// paint the whole picture. We aren't using this to map a file, but rather just a chunk of
+    /// memory that can be shared between processes. Because this can be shared between processes
+    /// and the changes from one process are immediately visible from a different process, this
+    /// very easily allows one to run into use-after-free issues if they are not safe.
+    ///
+    /// There is no way to prevent this sort of intra-process borrow-dependency in safe rust, so
+    /// one must simply be safe when using this. However, we do prevent one from easily
+    /// accidentally making two mmaps from the same [`Shm`] by modeling the fact that the map
+    /// borrows from the Shm in the type system with the [`BorrowedMap`] type.
+    pub unsafe fn map(&mut self, offset: usize) -> io::Result<BorrowedMap<'_>> {
         let size = self.size()?;
 
         if offset >= size {
@@ -141,10 +155,10 @@ impl Shm {
         opts.offset(offset as u64);
         opts.len(size - offset);
 
-        // SAFETY: This is sound because the potential unsoundness comes from having a file open
-        // that is written to/read from at the same time as another process. Since we're using a
-        // file descriptor that is unique to this process, that's not an issue here.
-        unsafe { opts.map_mut(self.fd) }
+        // SAFETY: Upheld by caller - see note above fn
+        let map = unsafe { opts.map_mut(self.fd) }?;
+
+        Ok(BorrowedMap { map, _borrowed: PhantomData })
     }
 
     pub fn unlink(self) -> io::Result<()> {
@@ -152,6 +166,23 @@ impl Shm {
             0 => Ok(()),
             _ => Err(io::Error::last_os_error()),
         }
+    }
+}
+
+/// A wrapper around an [`memmap2::MmapMut`] to prevent one from accidentally calling [`Shm::map`]
+/// twice on the same Shm (which could very easily introduce memory unsoundness). To use the
+/// contained map, just call [`BorrowedMap::map`]. One cannot move the map out of this struct, as
+/// that would easily allow them to break the lifetime-dependent relationship between this map and
+/// the [`Shm`] it's mapped onto
+#[derive(Debug)]
+pub struct BorrowedMap<'shm> {
+    map: MmapMut,
+    _borrowed: PhantomData<&'shm ()>
+}
+
+impl BorrowedMap<'_> {
+    pub fn map(&mut self) -> &mut MmapMut {
+        &mut self.map
     }
 }
 
@@ -167,14 +198,16 @@ mod test {
 
     #[test]
     fn offset_larger_than_map_fails() {
-        let shm = Shm::open(
+        let mut shm = Shm::open(
             "__psx_shm_oltmp_ahafeufhdmdhkeysmash",
             OpenOptions::READWRITE | OpenOptions::CREATE,
             OpenMode::R_USR | OpenMode::W_USR,
         )
         .unwrap();
         shm.set_size(20).unwrap();
-        let err = shm.map(21).unwrap_err();
+        // SAFETY: We aren't even trying to open anything here - we expect it to fail. So there's
+        // no potential for memory unsafety 'cause no memory should ever be mapped
+        let err = unsafe { shm.map(21) }.unwrap_err();
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
