@@ -11,6 +11,6 @@ repository = "https://github.com/nathansizemore/psx-shm"
 documentation = "https://docs.rs/psx-shm/"
 
 [dependencies]
-bitflags = "2.0"
-libc = "0.2"
+# need shm feature for the shm stuff, need fs feature for the type of one of the arguments for shm::open
+rustix = { version = "1", default-features = false, features = ["shm", "fs"] }
 memmap2 = "0.9.5"

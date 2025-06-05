@@ -5,71 +5,14 @@
 // distributed with this file, You can obtain one at
 // http://mozilla.org/MPL/2.0/.
 
-use std::{ffi::CString, io, marker::PhantomData, mem, os::fd::RawFd};
+use std::{ffi::{CStr, CString}, io, marker::PhantomData};
 
-use bitflags::bitflags;
 use memmap2::{MmapMut, MmapOptions};
-
-bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct OpenOptions: libc::c_int {
-        /// Create if not exists.
-        const CREATE = libc::O_CREAT;
-        /// Open for read.
-        const READ = libc::O_RDONLY;
-        /// Open for write.
-        const WRITE = libc::O_WRONLY;
-        /// Open for read+write. Note that this is not the same value as `OpenOptions::READ |
-        /// OpenOptions::Write`.
-        const READWRITE = libc::O_RDWR;
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct OpenMode: libc::mode_t {
-        /// User read.
-        const R_USR = libc::S_IRUSR;
-        /// User write.
-        const W_USR = libc::S_IWUSR;
-        /// Group read.
-        const R_GRP = libc::S_IRGRP;
-        /// Group write.
-        const W_GRP = libc::S_IWGRP;
-        /// Other read.
-        const R_OTH = libc::S_IROTH;
-        /// Other write.
-        const W_OTH = libc::S_IWOTH;
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct Protection: libc::c_int {
-        /// Pages may be executed.
-        const EXEC = libc::PROT_EXEC;
-        /// Pages may be read.
-        const READ = libc::PROT_READ;
-        /// Pages may be written.
-        const WRITE = libc::PROT_WRITE;
-        /// Pages may not be accessed.
-        const NONE = libc::PROT_NONE;
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct Mapping: libc::c_int {
-        /// Share this mapping.  Updates to the mapping are visible to
-        /// other processes mapping the same region, and (in the case
-        /// of file-backed mappings) are carried through to the
-        /// underlying file.
-        const SHARED = libc::MAP_SHARED;
-        /// Create a private copy-on-write mapping.  Updates to the
-        /// mapping are not visible to other processes mapping the
-        /// same file, and are not carried through to the underlying
-        /// file.
-        const PRIVATE = libc::MAP_PRIVATE;
-    }
-}
+use rustix::{fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd}, fs::Mode, shm::OFlags};
 
 #[derive(Debug)]
 pub struct Shm {
-    fd: RawFd,
+    fd: OwnedFd,
     // this `name` MUST always be valid utf8 - we just keep it as a CString cause that's what we
     // need to interact with the libc apis
     name: CString,
@@ -77,39 +20,25 @@ pub struct Shm {
 
 impl Shm {
     /// Opens shared memory at `name`.
-    pub fn open(name: &str, oflags: OpenOptions, mode: OpenMode) -> io::Result<Self> {
+    pub fn open(name: &str, oflags: OFlags, mode: Mode) -> io::Result<Self> {
         let cstr = CString::new(name).unwrap();
-        #[cfg(target_os = "macos")]
-        let r =
-            unsafe { libc::shm_open(cstr.as_ptr(), oflags.bits(), mode.bits() as libc::c_uint) };
-        #[cfg(target_os = "linux")]
-        let fd = unsafe { libc::shm_open(cstr.as_ptr(), oflags.bits(), mode.bits()) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let fd = rustix::shm::open(&*cstr, oflags, mode)
+            .map_err(|_| io::Error::last_os_error())?;
 
         Ok(Self { fd, name: cstr })
     }
 
     /// Returns the size of the shared memory reported by `fstat`.
     pub fn size(&self) -> io::Result<usize> {
-        let mut stat: libc::stat = unsafe { mem::zeroed() };
-        let r = unsafe { libc::fstat(self.fd, &mut stat) };
-        if r != 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        Ok(stat.st_size as usize)
+        rustix::fs::fstat(&self.fd)
+            .map(|stat| stat.st_size as usize)
+            .map_err(|_| io::Error::last_os_error())
     }
 
     /// Sets the size of the shared memory with `ftruncate`.
     pub fn set_size(&mut self, size: usize) -> io::Result<()> {
-        let r = unsafe { libc::ftruncate(self.fd, size as libc::off_t) };
-        if r == 0 {
-            return Ok(());
-        }
-
-        Err(io::Error::last_os_error())
+        rustix::fs::ftruncate(&self.fd, u64::try_from(size).unwrap_or(u64::MAX))
+            .map_err(|_| io::Error::last_os_error())
     }
 
     pub fn name(&self) -> &str {
@@ -156,24 +85,48 @@ impl Shm {
         opts.len(size - offset);
 
         // SAFETY: Upheld by caller - see note above fn
-        let map = unsafe { opts.map_mut(self.fd) }?;
+        let map = unsafe { opts.map_mut(self.fd.as_raw_fd()) }?;
 
         Ok(BorrowedMap { map, _borrowed: PhantomData })
     }
 
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+
     pub fn unlink(self) -> io::Result<()> {
-        match unsafe { libc::shm_unlink(self.name.as_ptr()) } {
-            0 => Ok(()),
-            _ => Err(io::Error::last_os_error()),
-        }
+        rustix::shm::unlink(&*self.name)
+            .map_err(|_| io::Error::last_os_error())
+    }
+
+    pub fn name_ptr(&self) -> &CStr {
+        &self.name
+    }
+}
+
+#[derive(Debug)]
+pub struct UnlinkOnDrop {
+    pub shm: Shm
+}
+
+impl Drop for UnlinkOnDrop {
+    fn drop(&mut self) {
+        _ = rustix::shm::unlink(self.shm.name_ptr())
     }
 }
 
 /// A wrapper around an [`memmap2::MmapMut`] to prevent one from accidentally calling [`Shm::map`]
 /// twice on the same Shm (which could very easily introduce memory unsoundness). To use the
-/// contained map, just call [`BorrowedMap::map`]. One cannot move the map out of this struct, as
-/// that would easily allow them to break the lifetime-dependent relationship between this map and
-/// the [`Shm`] it's mapped onto
+/// contained map, just call [`BorrowedMap::map`]. One cannot safely move the map out of this
+/// struct, as that would easily allow them to break the lifetime-dependent relationship between
+/// this map and the [`Shm`] it's mapped onto.
+///
+/// To be clear: This risk of memory unsafety does not come from an actual borrowing of memory
+/// between the [`Shm`] and the [`MmapMut`] - a [`MmapMut`] can be dropped before or after the
+/// [`Shm`] which it is mapped from and nothing bad will happen. The issue comes when two
+/// [`MmapMut`]s are mapped from the same [`Shm`] - this could allow e.g. something to borrow from
+/// one [`MmapMut`], then the other [`MmapMut`] could be shrunk, thus invalidating the references
+/// from the first map.
 #[derive(Debug)]
 pub struct BorrowedMap<'shm> {
     map: MmapMut,
@@ -184,11 +137,15 @@ impl BorrowedMap<'_> {
     pub fn map(&mut self) -> &mut MmapMut {
         &mut self.map
     }
-}
 
-impl Drop for Shm {
-    fn drop(&mut self) {
-        unsafe { libc::close(self.fd) };
+    /// Take the inner [`MmapMut`] out of this wrapper.
+    ///
+    /// # Safety
+    ///
+    /// This can can unsoundness if another Mmap is created from the [`Shm`] that this was derived
+    /// from. Read the struct-level documentation for more details.
+    pub unsafe fn into_map(self) -> MmapMut {
+        self.map
     }
 }
 
@@ -200,8 +157,8 @@ mod test {
     fn offset_larger_than_map_fails() {
         let mut shm = Shm::open(
             "__psx_shm_oltmp_ahafeufhdmdhkeysmash",
-            OpenOptions::READWRITE | OpenOptions::CREATE,
-            OpenMode::R_USR | OpenMode::W_USR,
+            OFlags::RDWR | OFlags::CREATE,
+            Mode::RUSR | Mode::WUSR,
         )
         .unwrap();
         shm.set_size(20).unwrap();
