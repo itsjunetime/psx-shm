@@ -7,7 +7,7 @@ description = "POSIX shared memory wrapper."
 readme = "README.md"
 keywords = ["posix", "shared", "memory", "ipc", "shm"]
 license = "MPL-2.0"
-repository = "https://github.com/nathansizemore/psx-shm"
+repository = "https://github.com/itsjunetime/psx-shm"
 documentation = "https://docs.rs/psx-shm/"
 
 [dependencies]
