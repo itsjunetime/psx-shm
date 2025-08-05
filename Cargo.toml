@@ -1,6 +1,6 @@
 [package]
 name = "psx-shm"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 authors = ["Nathan Sizemore <nathanrsizemore@gmail.com>"]
 description = "POSIX shared memory wrapper."
@@ -13,4 +13,4 @@ documentation = "https://docs.rs/psx-shm/"
 [dependencies]
 # need shm feature for the shm stuff, need fs feature for the type of one of the arguments for shm::open
 rustix = { version = "1", default-features = false, features = ["shm", "fs"] }
-memmap2 = "0.9.5"
+memmap2 = "0.9"
