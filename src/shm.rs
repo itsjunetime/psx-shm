@@ -5,10 +5,19 @@
 // distributed with this file, You can obtain one at
 // http://mozilla.org/MPL/2.0/.
 
-use std::{ffi::{CStr, CString}, io, marker::PhantomData};
+use std::{
+    ffi::{CStr, CString},
+    io,
+    marker::PhantomData,
+};
 
 use memmap2::{MmapMut, MmapOptions};
-use rustix::{fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd}, fs::Mode, shm::OFlags};
+use rustix::{
+    fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
+    fs::Mode,
+    io::Errno,
+    shm::OFlags,
+};
 
 #[derive(Debug)]
 pub struct Shm {
@@ -18,27 +27,51 @@ pub struct Shm {
     name: CString,
 }
 
+// for some reason, at least on my setup, I'll sometimes get errno 17 from opening an shm (errno 17
+// being `AlreadyExists`), but `last_os_error` will produce an error that just says "Success (error
+// code 0)", meaning (I guess) that the error somehow didn't get recorded to errno or something?
+// Moral of the story: convert directly with this fn instead of with `Error::last_os_error`
+fn to_io_err(e: Errno) -> io::Error {
+    io::Error::from_raw_os_error(e.raw_os_error())
+}
+
 impl Shm {
     /// Opens shared memory at `name`.
+    ///
+    /// # Errors
+    ///
+    /// This can error if the underlying `shm_open` syscall fails. This can happen due to a variety
+    /// of reasons, such as lack of permission, the named shm already existing when you use EXCL
+    /// oflag, and more. Consult `man 3 shm_open` for more details.
+    ///
+    /// # Panics
+    ///
+    /// This can panic if `name` contains a null byte
     pub fn open(name: &str, oflags: OFlags, mode: Mode) -> io::Result<Self> {
         let cstr = CString::new(name).unwrap();
-        let fd = rustix::shm::open(&*cstr, oflags, mode)
-            .map_err(|_| io::Error::last_os_error())?;
+        let fd = rustix::shm::open(&*cstr, oflags, mode).map_err(to_io_err)?;
 
         Ok(Self { fd, name: cstr })
     }
 
     /// Returns the size of the shared memory reported by `fstat`.
+    ///
+    /// # Errors
+    ///
+    /// Errors if the underlying `fstat` syscall fails for whatever reason
     pub fn size(&self) -> io::Result<usize> {
         rustix::fs::fstat(&self.fd)
             .map(|stat| stat.st_size as usize)
-            .map_err(|_| io::Error::last_os_error())
+            .map_err(to_io_err)
     }
 
     /// Sets the size of the shared memory with `ftruncate`.
+    ///
+    /// # Errors
+    ///
+    /// Errors if the underlying `ftruncate` syscall fails for whatever reason
     pub fn set_size(&mut self, size: usize) -> io::Result<()> {
-        rustix::fs::ftruncate(&self.fd, u64::try_from(size).unwrap_or(u64::MAX))
-            .map_err(|_| io::Error::last_os_error())
+        rustix::fs::ftruncate(&self.fd, u64::try_from(size).unwrap_or(u64::MAX)).map_err(to_io_err)
     }
 
     pub fn name(&self) -> &str {
@@ -69,6 +102,13 @@ impl Shm {
     /// one must simply be safe when using this. However, we do prevent one from easily
     /// accidentally making two mmaps from the same [`Shm`] by modeling the fact that the map
     /// borrows from the Shm in the type system with the [`BorrowedMap`] type.
+    ///
+    /// # Errors
+    ///
+    /// This can fail if:
+    /// 1. We cannot retrieve the shm's size with fstat
+    /// 2. The provided offset is greater than the size of the shm
+    /// 3. The underlying `mmap` call fails
     pub unsafe fn map(&mut self, offset: usize) -> io::Result<BorrowedMap<'_>> {
         let size = self.size()?;
 
@@ -87,18 +127,27 @@ impl Shm {
         // SAFETY: Upheld by caller - see note above fn
         let map = unsafe { opts.map_mut(self.fd.as_raw_fd()) }?;
 
-        Ok(BorrowedMap { map, _borrowed: PhantomData })
+        Ok(BorrowedMap {
+            map,
+            _borrowed: PhantomData,
+        })
     }
 
+    /// Get the fd that represents the shm to the system
     pub fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }
 
+    /// Unlink the shm; analogous to `shm_unlink`.
+    ///
+    /// # Errors
+    ///
+    /// This will return an error if the underlying `shm_unlink` call fails.
     pub fn unlink(self) -> io::Result<()> {
-        rustix::shm::unlink(&*self.name)
-            .map_err(|_| io::Error::last_os_error())
+        rustix::shm::unlink(&*self.name).map_err(to_io_err)
     }
 
+    /// Get a [`CStr`] representation of the name
     pub fn name_ptr(&self) -> &CStr {
         &self.name
     }
@@ -106,7 +155,7 @@ impl Shm {
 
 #[derive(Debug)]
 pub struct UnlinkOnDrop {
-    pub shm: Shm
+    pub shm: Shm,
 }
 
 impl Drop for UnlinkOnDrop {
@@ -130,7 +179,7 @@ impl Drop for UnlinkOnDrop {
 #[derive(Debug)]
 pub struct BorrowedMap<'shm> {
     map: MmapMut,
-    _borrowed: PhantomData<&'shm ()>
+    _borrowed: PhantomData<&'shm ()>,
 }
 
 impl BorrowedMap<'_> {
@@ -156,7 +205,7 @@ mod test {
     #[test]
     fn offset_larger_than_map_fails() {
         let mut shm = Shm::open(
-            "__psx_shm_oltmp_ahafeufhdmdhkeysmash",
+            "/__psx_shm_oltmp_ahafeufhdmdhkeysmash",
             OFlags::RDWR | OFlags::CREATE,
             Mode::RUSR | Mode::WUSR,
         )

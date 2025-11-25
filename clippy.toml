@@ -1,0 +1,4 @@
+disallowed-methods = [
+	# sometimes this doesn't report an error despite rustix saying that there was one
+	"::std::io::Error::last_os_error"
+]
